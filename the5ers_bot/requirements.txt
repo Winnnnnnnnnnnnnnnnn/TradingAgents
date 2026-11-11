@@ -1,0 +1,22 @@
+# The5ers multi-agent trading bot - Python dependencies
+# Install with: pip install -r requirements.txt
+
+# --- Broker connectivity ---------------------------------------------------- #
+metaapi-cloud-sdk>=27.0.0          # MetaApi Cloud SDK (async MetaTrader 4/5 bridge)
+
+# --- Dashboard / orchestration ---------------------------------------------- #
+streamlit>=1.32.0                  # Monitoring dashboard
+streamlit-autorefresh>=1.0.1       # Periodic dashboard refresh (optional; degrades gracefully)
+
+# --- Data / analytics ------------------------------------------------------- #
+pandas>=2.0.0                      # Candle frames, indicators, dashboard tables
+numpy>=1.24.0                      # Numeric helpers for EMA / RSI / ATR
+
+# --- Utilities -------------------------------------------------------------- #
+python-dotenv>=1.0.0               # Load credentials from .env
+requests>=2.31.0                   # HTTP transport used by the MetaApi SDK
+tzdata>=2024.1                     # IANA timezone database for the daily rollover
+
+# --- Optional extras -------------------------------------------------------- #
+# MetaTrader5>=5.0.45              # Local MT5 terminal bridge - WINDOWS ONLY
+# plotly>=5.18.0                   # Add interactive equity charts to the dashboard
