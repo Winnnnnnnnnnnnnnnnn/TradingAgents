@@ -1,0 +1,11 @@
+# Secrets - never commit
+.env
+
+# Runtime kill-switch state
+.state/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
