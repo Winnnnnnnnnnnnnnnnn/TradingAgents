@@ -47,8 +47,9 @@ cp .env.example .env 2>/dev/null || true
 
 ### `.env` reference
 
-Sensitive values live **only** in `.env` (never in source). Create a `.env` next to
-`app.py`:
+Sensitive values live in `.env` (never in source). The MetaApi token and account id can
+alternatively be entered at runtime in the dashboard sidebar — see
+[Dashboard controls](#dashboard-controls). Create a `.env` next to `app.py`:
 
 ```dotenv
 # ---------------------------------------------------------------------------
@@ -143,22 +144,50 @@ set `DRY_RUN=false`.
   which is how prop firms evaluate daily drawdown.
 * State is persisted to `KILL_SWITCH_STATE_FILE`, so a restart never forgets a lock.
 * The daily baseline rolls over automatically at `DAILY_RESET_TZ` midnight.
+* The state file is bound to a single MetaApi **account id**. Switching accounts clears
+  the daily state, so a `$5,000` baseline can never be carried onto a `$10,000` account
+  and instantly trip the profit cap.
 * Position sizing never risks more than `RISK_PER_TRADE_PCT` of equity **and** never
   more than the remaining daily loss budget. If the minimum lot size would exceed the
   remaining budget, the trade is rejected rather than downgraded.
 
 ## Dashboard controls
 
-* **Start / Stop** — starts or stops the background trading thread.
-* **Emergency close all** — flattens every open position immediately.
-* **Reset kill switch** — re-arms the day from the current balance (requires the
-  confirmation checkbox).
-* Live metrics: equity, balance, day P&L, progress to the `+$60` target, remaining
-  risk budget, open positions, signals and trade log.
+**🔐 MetaApi Credentials** (sidebar)
+
+* Enter your **MetaApi Token** (masked, password-style) and **MetaApi Account ID**
+  directly in the dashboard, then press **Save credentials**.
+* Pressing **Start Bot** also picks up whatever is currently typed in those fields.
+* If a field is left **empty**, the bot falls back to `METAAPI_TOKEN` /
+  `METAAPI_ACCOUNT_ID` from `.env` — so both workflows are supported.
+* The caption under the inputs always shows what is **in effect** (token masked,
+  account id, and whether it came from the Dashboard or the Environment).
+* Credentials are held in the browser session's memory only and are **never written to
+  disk**. They are applied on the next **Start Bot**; changing them while the bot is
+  running shows a reminder to restart.
+
+**🎛️ Controls**
+
+* **Start Bot / Stop Bot** — a single switcher that toggles the background trading thread.
+* **Emergency Close All Positions** — flattens every open position immediately.
+* **🔓 Reset Kill-Switch** — re-arms the day from the current balance and is disabled
+  until the safety confirmation checkbox is ticked.
+
+**📊 Metric cards**
+
+* **Daily P&L** with a progress bar towards the `+$60` daily cap, plus the remaining
+  amount to target and the remaining daily risk budget.
+* **Balance** and **Equity** (equity shows floating P&L).
+* **Kill-Switch** status — `ACTIVE`, `ARMED · IDLE`, `LOCKED · MANUAL`,
+  `LOCKED · TARGET BANKED`, or `EMERGENCY STOPPED` — mirrored by a coloured banner.
+* Operational row: open positions, trades today, loop state, broker connection, last tick.
 
 ## Security notes
 
-* No credentials are hard-coded; everything is read from environment variables.
+* No credentials are hard-coded; they come from the dashboard inputs or environment
+  variables.
+* Dashboard-entered tokens live in Streamlit session memory only — they are never
+  persisted to disk and never rendered back in full (always masked).
 * `.env` and `.state/` should be git-ignored — add them to your `.gitignore`.
 * The kill switch reset intentionally requires `force=True`, so it cannot be cleared
   accidentally by a stray code path.
@@ -167,7 +196,7 @@ set `DRY_RUN=false`.
 
 | Symptom | Fix |
 | --- | --- |
-| `METAAPI_TOKEN is missing` | Populate `.env` or set `PAPER_MODE=true`. |
+| `METAAPI_TOKEN is missing` | Enter it in the dashboard's **MetaApi Credentials** panel, populate `.env`, or set `PAPER_MODE=true`. |
 | `metaapi_cloud_sdk is not installed` | `pip install -r requirements.txt`. |
 | Symbols never trade | Check `SYMBOL_SUFFIX` matches your broker (e.g. `BTCUSD.a`). |
 | `Risk budget ... below the minimum lot risk` | Lower `RISK_PER_TRADE_PCT` won't help; use a smaller-volume instrument or a larger account. |

@@ -155,6 +155,7 @@ class KillSwitch:
     @staticmethod
     def _default_state() -> Dict[str, Any]:
         return {
+            "account_scope": None,
             "trading_day": None,
             "day_start_balance": None,
             "locked": False,
@@ -189,6 +190,34 @@ class KillSwitch:
             tmp.replace(self.state_file)
         except OSError as exc:  # pragma: no cover - disk issues
             LOGGER.error("Could not persist kill switch state: %s", exc)
+
+    def set_account_scope(self, scope: Optional[str]) -> bool:
+        """Bind the persisted state to one trading account.
+
+        Switching accounts must never inherit the other account's daily baseline
+        or lock (a $5,000 baseline carried onto a $10,000 account would trip the
+        profit cap instantly), so a genuine scope change clears the daily state.
+        Returns True when the state was cleared.
+        """
+        scope = (scope or "").strip() or None
+        with self._lock:
+            stored = self._state.get("account_scope")
+            if stored == scope:
+                return False
+            if stored is None:
+                # Adopt state written before scoping existed rather than discarding it.
+                self._state["account_scope"] = scope
+                self._persist()
+                LOGGER.info("Kill switch bound to account scope %s.", scope or "(default)")
+                return False
+
+            self._state = self._default_state()
+            self._state["account_scope"] = scope
+            self._persist()
+            LOGGER.warning(
+                "Kill switch rebound from account %s to %s - daily state cleared.", stored, scope,
+            )
+            return True
 
     # ------------------------------------------------------------------ #
     # Time helpers
@@ -416,6 +445,7 @@ class KillSwitch:
                 "lock_type": self._state.get("lock_type", KillLockType.NONE.value),
                 "lock_reason": self._state.get("lock_reason", ""),
                 "locked_at": self._state.get("locked_at"),
+                "account_scope": self._state.get("account_scope"),
                 "trading_day": self._state.get("trading_day"),
                 "day_start_balance": self._state.get("day_start_balance"),
                 "last_equity": self._state.get("last_equity"),

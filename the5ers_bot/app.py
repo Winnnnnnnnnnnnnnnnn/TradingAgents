@@ -66,6 +66,15 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
+def _mask(secret: str, keep: int = 4) -> str:
+    """Mask a secret for display, keeping only the last few characters."""
+    if not secret:
+        return ""
+    if len(secret) <= keep:
+        return "*" * len(secret)
+    return "*" * (len(secret) - keep) + secret[-keep:]
+
+
 @dataclass
 class BotConfig:
     """Runtime configuration, sourced entirely from environment variables."""
@@ -397,6 +406,10 @@ class TradingOrchestrator:
         self.config = config or BotConfig.from_env()
         self.kill_switch = kill_switch or KillSwitch()
 
+        # Credentials can be supplied at runtime from the dashboard. Empty values
+        # fall back to METAAPI_TOKEN / METAAPI_ACCOUNT_ID from the environment.
+        self._credentials: Dict[str, str] = {"token": "", "account_id": ""}
+
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_event = threading.Event()
@@ -440,6 +453,45 @@ class TradingOrchestrator:
             self._events.append(line)
         LOGGER.info(message)
 
+    def set_credentials(self, token: Optional[str] = None, account_id: Optional[str] = None) -> bool:
+        """Store dashboard-supplied credentials for the next connection attempt.
+
+        Blank values are stored as empty strings, which makes ``BrokerClient``
+        fall back to ``METAAPI_TOKEN`` / ``METAAPI_ACCOUNT_ID`` from the
+        environment. Returns True when the stored values actually changed.
+        """
+        token = (token or "").strip()
+        account_id = (account_id or "").strip()
+        with self._lock:
+            changed = (token, account_id) != (self._credentials["token"], self._credentials["account_id"])
+            self._credentials = {"token": token, "account_id": account_id}
+        if changed:
+            source = "dashboard" if (token or account_id) else "environment"
+            self.log_event(f"Credentials updated (source: {source}). Restart the bot to apply them.")
+        return changed
+
+    def _effective_credentials(self) -> Dict[str, str]:
+        """Resolve dashboard credentials, falling back to the environment."""
+        with self._lock:
+            ui_token, ui_account = self._credentials["token"], self._credentials["account_id"]
+        return {
+            "token": ui_token or os.getenv("METAAPI_TOKEN", "").strip(),
+            "account_id": ui_account or os.getenv("METAAPI_ACCOUNT_ID", "").strip(),
+        }
+
+    def credentials_info(self) -> Dict[str, Any]:
+        """Describe which credentials the bot would use, with the token masked."""
+        with self._lock:
+            ui_token, ui_account = self._credentials["token"], self._credentials["account_id"]
+        env_token, env_account = os.getenv("METAAPI_TOKEN", "").strip(), os.getenv("METAAPI_ACCOUNT_ID", "").strip()
+        effective = self._effective_credentials()
+        return {
+            "token_masked": _mask(effective["token"]),
+            "token_source": "Dashboard" if ui_token else ("Environment" if env_token else "Missing"),
+            "account_id": effective["account_id"] or "(not set)",
+            "account_source": "Dashboard" if ui_account else ("Environment" if env_account else "Missing"),
+        }
+
     def start(self) -> bool:
         """Start the background trading loop. Returns False if already running."""
         with self._lock:
@@ -472,6 +524,7 @@ class TradingOrchestrator:
                 "trades": list(self._trades),
                 "events": list(self._events),
                 "kill_switch": self.kill_switch.status(),
+                "credentials": self.credentials_info(),
             }
 
     def close_all_now(self, timeout: float = 60.0) -> List[TradeResult]:
@@ -518,7 +571,17 @@ class TradingOrchestrator:
             self._broker = None
 
     async def _run(self) -> None:
-        self._broker = BrokerClient(paper_mode=self.config.paper_mode)
+        creds = self._effective_credentials()
+
+        # Bind the kill-switch state to this account: switching accounts must never
+        # inherit another account's daily baseline or lock.
+        self.kill_switch.set_account_scope(creds["account_id"] or None)
+
+        self._broker = BrokerClient(
+            token=creds["token"] or None,
+            account_id=creds["account_id"] or None,
+            paper_mode=self.config.paper_mode,
+        )
         await self._broker.connect()
 
         self._market_agent = MarketDataAgent(self._broker, self.config)
@@ -701,7 +764,13 @@ def run_single_pass() -> int:
     orchestrator = TradingOrchestrator(config)
 
     async def _one_pass() -> None:
-        orchestrator._broker = BrokerClient(paper_mode=config.paper_mode)
+        creds = orchestrator._effective_credentials()
+        orchestrator.kill_switch.set_account_scope(creds["account_id"] or None)
+        orchestrator._broker = BrokerClient(
+            token=creds["token"] or None,
+            account_id=creds["account_id"] or None,
+            paper_mode=config.paper_mode,
+        )
         await orchestrator._broker.connect()
         orchestrator._market_agent = MarketDataAgent(orchestrator._broker, config)
         orchestrator._strategy_agent = StrategyAgent(config)
@@ -728,6 +797,24 @@ def run_single_pass() -> int:
 # --------------------------------------------------------------------------- #
 # Streamlit dashboard
 # --------------------------------------------------------------------------- #
+def _kill_switch_state(kill_status: Dict[str, Any], running: bool) -> tuple:
+    """Map the raw kill-switch status onto a (label, level) pair for the UI.
+
+    ``level`` is one of ``emergency`` / ``locked`` / ``active`` / ``idle`` and
+    drives which coloured banner the dashboard renders.
+    """
+    if kill_status.get("locked"):
+        lock_type = kill_status.get("lock_type")
+        if lock_type == "max_daily_loss":
+            return "EMERGENCY STOPPED", "emergency"
+        if lock_type == "profit_target":
+            return "LOCKED · TARGET BANKED", "locked"
+        return "LOCKED · MANUAL", "locked"
+    if running:
+        return "ACTIVE", "active"
+    return "ARMED · IDLE", "idle"
+
+
 def _render_dashboard() -> None:
     import streamlit as st
 
@@ -755,72 +842,133 @@ def _render_dashboard() -> None:
         banner += " · DRY RUN (no orders sent)"
     st.caption(f"{banner} · The5ers Bootcamp $5,000 · MetaApi / MT5 (async)")
 
+    account: Optional[AccountInfo] = state.get("account")
+    decision: Optional[KillSwitchDecision] = state.get("decision")
+    positions: List[PositionInfo] = state.get("positions") or []
+    ks_state, ks_level = _kill_switch_state(kill_status, orchestrator.is_running)
+
     autorefresh = st.sidebar.toggle("Auto-refresh (5s)", value=True)
     if autorefresh:
         st_autorefresh(interval=5000, key="the5ers-autorefresh")
 
-    # ---- controls -------------------------------------------------------- #
-    st.sidebar.header("Controls")
-    col_a, col_b = st.sidebar.columns(2)
-    with col_a:
-        if st.button("▶ Start", use_container_width=True, disabled=orchestrator.is_running):
-            orchestrator.start()
+    # ---- sidebar: MetaApi credentials ------------------------------------ #
+    env_account = os.getenv("METAAPI_ACCOUNT_ID", "").strip()
+    st.session_state.setdefault("ui_token", "")
+    st.session_state.setdefault("ui_account_id", "")
+
+    with st.sidebar.expander("🔐 MetaApi Credentials", expanded=not state["connected"]):
+        flash = st.session_state.pop("creds_flash", None)
+        if flash:
+            st.success(flash)
+        if config.paper_mode:
+            st.info("PAPER_MODE is on - credentials are ignored.")
+        ui_token = st.text_input(
+            "MetaApi Token",
+            key="ui_token",
+            type="password",
+            placeholder="leave empty to use .env",
+            help="Held in this browser session only - never written to disk.",
+        )
+        ui_account = st.text_input(
+            "MetaApi Account ID",
+            key="ui_account_id",
+            placeholder=env_account or "leave empty to use .env",
+        )
+        if st.button("💾 Save credentials", use_container_width=True):
+            orchestrator.set_credentials(ui_token, ui_account)
+            st.session_state["creds_flash"] = (
+                "Saved. Stop and Start the bot to apply them."
+                if orchestrator.is_running
+                else "Credentials saved."
+            )
             st.rerun()
-    with col_b:
-        if st.button("⏹ Stop", use_container_width=True, disabled=not orchestrator.is_running):
+
+        info = snapshot["credentials"]
+        st.caption(
+            f"**In effect** · token `{info['token_masked'] or '—'}` ({info['token_source']}) · "
+            f"account `{info['account_id']}` ({info['account_source']})"
+        )
+
+    # ---- sidebar: controls ----------------------------------------------- #
+    st.sidebar.header("🎛️ Controls")
+    if orchestrator.is_running:
+        if st.sidebar.button("⏹ Stop Bot", use_container_width=True, type="primary"):
             orchestrator.stop()
             st.rerun()
-
-    if st.sidebar.button("🛑 Emergency close all", use_container_width=True):
-        results = orchestrator.close_all_now()
-        st.sidebar.success(f"Closed {len(results)} position(s).")
-
-    st.sidebar.divider()
-    st.sidebar.subheader("Kill switch")
-    if kill_status["locked"]:
-        st.sidebar.error(f"LOCKED: {kill_status['lock_type'].upper()}\n\n{kill_status['lock_reason']}")
     else:
-        st.sidebar.success("Armed - trading permitted")
+        if st.sidebar.button("▶ Start Bot", use_container_width=True, type="primary"):
+            # Apply whatever is currently typed in the credential fields.
+            orchestrator.set_credentials(st.session_state.get("ui_token", ""), st.session_state.get("ui_account_id", ""))
+            orchestrator.start()
+            st.rerun()
 
-    confirm_reset = st.sidebar.checkbox("I understand resetting re-arms the day", value=False)
-    if st.sidebar.button("🔓 Reset kill switch", use_container_width=True, disabled=not confirm_reset):
-        account = state.get("account")
+    if st.sidebar.button("🛑 Emergency Close All Positions", use_container_width=True, disabled=not positions):
+        with st.spinner("Closing all positions..."):
+            results = orchestrator.close_all_now()
+        if results:
+            st.sidebar.success(f"Closed {len(results)} position(s).")
+        else:
+            st.sidebar.info("Nothing to close.")
+
+    # ---- sidebar: kill switch -------------------------------------------- #
+    st.sidebar.divider()
+    st.sidebar.header("🚨 Kill-Switch")
+    if ks_level == "emergency":
+        st.sidebar.error(f"**{ks_state}**\n\n{kill_status['lock_reason']}")
+    elif ks_level == "locked":
+        st.sidebar.warning(f"**{ks_state}**\n\n{kill_status['lock_reason']}")
+    else:
+        st.sidebar.success(f"**{ks_state}** - trading permitted")
+
+    confirm_reset = st.sidebar.checkbox(
+        "I understand this re-arms the day from the current balance", value=False
+    )
+    if st.sidebar.button("🔓 Reset Kill-Switch", use_container_width=True, disabled=not confirm_reset):
         balance = account.balance if account is not None else None
-        decision = orchestrator.kill_switch.reset(current_balance=balance, reason="Dashboard operator reset.", force=True)
-        orchestrator.log_event(f"Kill switch reset from dashboard: {decision.reason}")
+        decision_reset = orchestrator.kill_switch.reset(
+            current_balance=balance, reason="Dashboard operator reset.", force=True
+        )
+        orchestrator.log_event(f"Kill switch reset from dashboard: {decision_reset.reason}")
         st.rerun()
 
-    # ---- metrics --------------------------------------------------------- #
-    account: Optional[AccountInfo] = state.get("account")
-    decision: Optional[KillSwitchDecision] = state.get("decision")
-    positions: List[PositionInfo] = state.get("positions") or []
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Equity", f"${account.equity:,.2f}" if account else "—",
-              f"{account.floating_pnl:+,.2f} floating" if account else None)
-    m2.metric("Balance", f"${account.balance:,.2f}" if account else "—")
-    m3.metric("Day P&L", f"${decision.daily_pnl:+,.2f}" if decision else "—")
-    m4.metric("Open positions", f"{len(positions)} / {config.max_open_positions}")
-    m5.metric("Trades today", kill_status["trades_today"])
+    # ---- metric cards ---------------------------------------------------- #
+    st.subheader("📊 Daily performance")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        "Daily P&L",
+        f"${decision.daily_pnl:+,.2f}" if decision else "—",
+        f"{account.floating_pnl:+,.2f} floating" if account else None,
+    )
+    c2.metric("Balance", f"${account.balance:,.2f}" if account else "—")
+    c3.metric("Equity", f"${account.equity:,.2f}" if account else "—")
+    c4.metric("Kill-Switch", ks_state)
 
     if decision is not None:
         st.progress(
             decision.progress_to_target,
-            text=(f"Daily target +${decision.profit_target:,.0f} · "
+            text=(f"Progress to the +${decision.profit_target:,.0f} daily cap · "
                   f"current {decision.daily_pnl:+.2f} · remaining +{decision.remaining_to_target:,.2f} · "
                   f"risk budget left ${decision.remaining_risk:,.2f} of -${decision.max_daily_loss:,.0f}"),
         )
+    else:
+        st.caption(
+            f"Waiting for the first tick to measure daily P&L against the "
+            f"+${kill_status['profit_target']:,.0f} target and -${kill_status['max_daily_loss']:,.0f} stop."
+        )
 
-    status_cols = st.columns(4)
-    status_cols[0].metric("Loop", "RUNNING" if state["running"] else "STOPPED")
-    status_cols[1].metric("Broker", "CONNECTED" if state["connected"] else "DISCONNECTED")
-    status_cols[2].metric("Ticks", state["tick_count"])
-    status_cols[3].metric("Last tick", (state["last_tick"] or "—")[11:19] or "—")
+    o1, o2, o3, o4, o5 = st.columns(5)
+    o1.metric("Open positions", f"{len(positions)} / {config.max_open_positions}")
+    o2.metric("Trades today", kill_status["trades_today"])
+    o3.metric("Loop", "RUNNING" if state["running"] else "STOPPED")
+    o4.metric("Broker", "CONNECTED" if state["connected"] else "DISCONNECTED")
+    o5.metric("Last tick", (state["last_tick"] or "—")[11:19] or "—")
 
+    if ks_level == "emergency":
+        st.error(f"🚨 EMERGENCY STOP - {kill_status['lock_reason']}")
+    elif ks_level == "locked":
+        st.warning(f"🔒 Kill-switch locked - {kill_status['lock_reason']}")
     if state.get("last_error"):
         st.error(f"Last error: {state['last_error']}")
-    if kill_status["locked"]:
-        st.warning(f"🚫 {kill_status['lock_reason']}")
 
     # ---- positions ------------------------------------------------------- #
     st.subheader("Open positions")
@@ -865,7 +1013,15 @@ def _render_dashboard() -> None:
 
     # ---- config & events ------------------------------------------------- #
     with st.expander("Configuration"):
-        settings = {**config.summary(), **{f"kill_switch.{k}": v for k, v in kill_status.items()}}
+        credentials = snapshot["credentials"]
+        settings = {
+            **config.summary(),
+            "credentials.token": credentials["token_masked"] or "(not set)",
+            "credentials.token source": credentials["token_source"],
+            "credentials.account id": credentials["account_id"],
+            "credentials.account source": credentials["account_source"],
+            **{f"kill_switch.{k}": v for k, v in kill_status.items()},
+        }
         st.table(pd.DataFrame({"Setting": list(settings), "Value": [str(v) for v in settings.values()]}))
 
     with st.expander("Event log", expanded=False):
