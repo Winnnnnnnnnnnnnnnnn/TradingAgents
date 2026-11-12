@@ -1,0 +1,11 @@
+# Streamlit server config tuned for headless cloud hosting
+# (e.g. Hugging Face Spaces / Docker). Local `streamlit run app.py` still works.
+[server]
+headless = true
+address = "0.0.0.0"
+port = 7860
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false

@@ -84,7 +84,7 @@ RSI_LONG_MIN=52
 RSI_SHORT_MAX=48
 ATR_PERIOD=14
 ATR_STOP_MULTIPLIER=2.0
-REWARD_RISK=1.8
+REWARD_RISK=3.0                          # strict minimum 1:3 (smaller values are clamped up)
 RISK_PER_TRADE_PCT=0.5
 MAX_OPEN_POSITIONS=2
 
@@ -125,6 +125,24 @@ python broker_client.py
 python kill_switch.py
 ```
 
+### Cloud deployment (Hugging Face Spaces)
+
+The dashboard is ready to run as a **Streamlit Space**:
+
+1. Create a new Space → **SDK: Streamlit** → this `the5ers_bot` folder becomes the repo
+   root (`app.py`, `requirements.txt` and `.streamlit/config.toml` at the top level).
+2. Set secrets/env vars under **Settings → Variables and secrets** (`METAAPI_TOKEN`,
+   `METAAPI_ACCOUNT_ID`, or `PAPER_MODE=true` to demo the UI without credentials) —
+   or just type them into the sidebar at runtime.
+3. The bundled `.streamlit/config.toml` already runs the server **headless** on
+   `0.0.0.0:7860` with CORS/XSRF relaxed for the Space proxy, so no extra flags are
+   needed.
+
+> **Caveat:** the kill-switch state file (`.state/`) and the background thread live on
+> the Space's ephemeral filesystem. For long-running keys use a **persistent** Space and
+> the dashboard's Reset button after a rebuild, or run on a VM if you need hard
+> state guarantees.
+
 ### Safe first run
 
 Set `PAPER_MODE=true` first to exercise the full pipeline with synthetic prices and
@@ -150,6 +168,10 @@ set `DRY_RUN=false`.
 * Position sizing never risks more than `RISK_PER_TRADE_PCT` of equity **and** never
   more than the remaining daily loss budget. If the minimum lot size would exceed the
   remaining budget, the trade is rejected rather than downgraded.
+* Every setup must offer a strict **minimum 1:3** reward:risk. `REWARD_RISK` is clamped
+  up to `1:3` at runtime, so the bot can never emit a worse-than-1:3 trade.
+* On a lock trip the bot **auto-flattens all open positions by default**
+  (`KILL_SWITCH_AUTO_CLOSE=true`) and stops opening new trades for the rest of the day.
 
 ## Dashboard controls
 

@@ -25,7 +25,7 @@ KILL_SWITCH_STATE_FILE   persistence path (default: .state/kill_switch_state.jso
 DAILY_PROFIT_TARGET      +60.0 USD by default
 DAILY_MAX_LOSS           -100.0 USD by default
 DAILY_RESET_TZ           IANA timezone used for the daily rollover (default UTC)
-KILL_SWITCH_AUTO_CLOSE   "true" to flatten positions the moment a lock trips
+KILL_SWITCH_AUTO_CLOSE   "true" (default) to flatten all positions the moment a lock trips
 """
 
 from __future__ import annotations
@@ -140,7 +140,7 @@ class KillSwitch:
         )
         self.reset_timezone_name = reset_timezone or os.getenv("DAILY_RESET_TZ", "UTC")
         self.auto_close_on_lock = (
-            _as_bool(os.getenv("KILL_SWITCH_AUTO_CLOSE"), False)
+            _as_bool(os.getenv("KILL_SWITCH_AUTO_CLOSE"), True)
             if auto_close_on_lock is None
             else auto_close_on_lock
         )

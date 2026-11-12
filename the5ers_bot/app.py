@@ -42,6 +42,10 @@ load_dotenv()
 
 LOGGER = logging.getLogger("the5ers.bot")
 
+# Strict minimum reward:risk for any setup (1:3). A smaller REWARD_RISK is clamped
+# up to this floor so the bot can never emit a trade with a worse-than-1:3 profile.
+MIN_REWARD_RISK = 3.0
+
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -92,7 +96,7 @@ class BotConfig:
 
     atr_period: int = 14
     atr_stop_multiplier: float = 2.0
-    reward_risk: float = 1.8
+    reward_risk: float = MIN_REWARD_RISK
     risk_per_trade_pct: float = 0.5
     max_open_positions: int = 2
 
@@ -118,7 +122,8 @@ class BotConfig:
             rsi_short_max=_as_float(os.getenv("RSI_SHORT_MAX"), 48.0),
             atr_period=_as_int(os.getenv("ATR_PERIOD"), 14),
             atr_stop_multiplier=_as_float(os.getenv("ATR_STOP_MULTIPLIER"), 2.0),
-            reward_risk=_as_float(os.getenv("REWARD_RISK"), 1.8),
+            # Strict minimum 1:3 - a lower REWARD_RISK is clamped up to the floor.
+            reward_risk=max(MIN_REWARD_RISK, _as_float(os.getenv("REWARD_RISK"), MIN_REWARD_RISK)),
             risk_per_trade_pct=_as_float(os.getenv("RISK_PER_TRADE_PCT"), 0.5),
             max_open_positions=_as_int(os.getenv("MAX_OPEN_POSITIONS"), 2),
             dry_run=_as_bool(os.getenv("DRY_RUN"), False),
@@ -133,7 +138,7 @@ class BotConfig:
             "EMA fast / slow": f"{self.ema_fast} / {self.ema_slow}",
             "Risk per trade": f"{self.risk_per_trade_pct}% of equity",
             "Stop distance": f"{self.atr_stop_multiplier} x ATR({self.atr_period})",
-            "Reward : risk": self.reward_risk,
+            "Reward : risk": f"1 : {self.reward_risk:g} (min 1:{MIN_REWARD_RISK:g})",
             "Max open positions": self.max_open_positions,
             "Paper mode": self.paper_mode,
             "Dry run": self.dry_run,
