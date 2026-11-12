@@ -1,0 +1,16 @@
+# Repository-root Streamlit configuration.
+#
+# Streamlit Community Cloud always runs from the repository root and requires the
+# config at `.streamlit/config.toml` here (an app-specific copy next to the
+# entrypoint, e.g. `the5ers_bot/.streamlit/config.toml`, overrides these values).
+# No port/host/CORS/XSRF overrides on purpose - the platform manages serving.
+
+[theme]
+base = "dark"
+primaryColor = "#2e7d32"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

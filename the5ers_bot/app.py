@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import logging
 import os
+import sys
 import threading
 import time
 from collections import deque
@@ -34,6 +35,11 @@ from typing import Any, Deque, Dict, List, Optional
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+
+# Streamlit Community Cloud runs `streamlit run the5ers_bot/app.py` from the
+# repository root, so this file's own directory is not automatically importable.
+# Prepending it makes the sibling modules resolve no matter the working directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from broker_client import AccountInfo, BrokerClient, OrderSide, PositionInfo, TradeResult
 from kill_switch import KillSwitch, KillSwitchDecision
@@ -77,6 +83,35 @@ def _mask(secret: str, keep: int = 4) -> str:
     if len(secret) <= keep:
         return "*" * len(secret)
     return "*" * (len(secret) - keep) + secret[-keep:]
+
+
+def _streamlit_secret(key: str) -> str:
+    """Read a value from ``st.secrets`` when running inside Streamlit.
+
+    On Streamlit Community Cloud credentials live in the Secrets manager, which is
+    exposed to the app as ``st.secrets``. Returns ``""`` outside a Streamlit runtime
+    or when the key is absent, so local (``.env``) runs are unaffected.
+    """
+    try:
+        import streamlit as st
+    except Exception:  # streamlit not installed / not a Streamlit process
+        return ""
+    try:
+        value = st.secrets.get(key, "")
+    except Exception:  # no secrets file, malformed TOML, missing key, ...
+        return ""
+    return str(value).strip() if value not in (None, "") else ""
+
+
+def _credential_source(dashboard: str, secret: str, env: str) -> str:
+    """Label where a credential value came from, in resolution order."""
+    if dashboard:
+        return "Dashboard"
+    if secret:
+        return "Streamlit secrets"
+    if env:
+        return "Environment"
+    return "Missing"
 
 
 @dataclass
@@ -476,25 +511,27 @@ class TradingOrchestrator:
         return changed
 
     def _effective_credentials(self) -> Dict[str, str]:
-        """Resolve dashboard credentials, falling back to the environment."""
+        """Resolve credentials: dashboard inputs, then ``st.secrets``, then environment."""
         with self._lock:
             ui_token, ui_account = self._credentials["token"], self._credentials["account_id"]
         return {
-            "token": ui_token or os.getenv("METAAPI_TOKEN", "").strip(),
-            "account_id": ui_account or os.getenv("METAAPI_ACCOUNT_ID", "").strip(),
+            "token": ui_token or _streamlit_secret("METAAPI_TOKEN") or os.getenv("METAAPI_TOKEN", "").strip(),
+            "account_id": ui_account or _streamlit_secret("METAAPI_ACCOUNT_ID") or os.getenv("METAAPI_ACCOUNT_ID", "").strip(),
         }
 
     def credentials_info(self) -> Dict[str, Any]:
         """Describe which credentials the bot would use, with the token masked."""
         with self._lock:
             ui_token, ui_account = self._credentials["token"], self._credentials["account_id"]
+        secret_token = _streamlit_secret("METAAPI_TOKEN")
+        secret_account = _streamlit_secret("METAAPI_ACCOUNT_ID")
         env_token, env_account = os.getenv("METAAPI_TOKEN", "").strip(), os.getenv("METAAPI_ACCOUNT_ID", "").strip()
         effective = self._effective_credentials()
         return {
             "token_masked": _mask(effective["token"]),
-            "token_source": "Dashboard" if ui_token else ("Environment" if env_token else "Missing"),
+            "token_source": _credential_source(ui_token, secret_token, env_token),
             "account_id": effective["account_id"] or "(not set)",
-            "account_source": "Dashboard" if ui_account else ("Environment" if env_account else "Missing"),
+            "account_source": _credential_source(ui_account, secret_account, env_account),
         }
 
     def start(self) -> bool:
@@ -761,6 +798,30 @@ class TradingOrchestrator:
 
 
 # --------------------------------------------------------------------------- #
+# Process-wide orchestrator singleton
+# --------------------------------------------------------------------------- #
+_ORCHESTRATOR: Optional["TradingOrchestrator"] = None
+_ORCHESTRATOR_LOCK = threading.Lock()
+
+
+def get_orchestrator(config: Optional[BotConfig] = None) -> "TradingOrchestrator":
+    """Return the single process-wide orchestrator instance.
+
+    Streamlit reruns this script on every interaction and may serve several browser
+    sessions from one process. Building a fresh orchestrator each time would spawn
+    duplicate background trading threads and split the kill-switch state across them,
+    so the instance is created once, race-free, and reused everywhere. Trading state
+    that must survive restarts lives in the kill-switch state file, not in memory.
+    """
+    global _ORCHESTRATOR
+    if _ORCHESTRATOR is None:
+        with _ORCHESTRATOR_LOCK:
+            if _ORCHESTRATOR is None:
+                _ORCHESTRATOR = TradingOrchestrator(config or BotConfig.from_env())
+    return _ORCHESTRATOR
+
+
+# --------------------------------------------------------------------------- #
 # Headless single pass (smoke test / cron usage)
 # --------------------------------------------------------------------------- #
 def run_single_pass() -> int:
@@ -833,9 +894,7 @@ def _render_dashboard() -> None:
     st.set_page_config(page_title="The5ers Multi-Agent Trading Bot", page_icon="🤖", layout="wide")
 
     config = BotConfig.from_env()
-    if "orchestrator" not in st.session_state:
-        st.session_state.orchestrator = TradingOrchestrator(config)
-    orchestrator: TradingOrchestrator = st.session_state.orchestrator
+    orchestrator = get_orchestrator(config)
     snapshot = orchestrator.snapshot()
     state = snapshot["state"]
     kill_status = snapshot["kill_switch"]

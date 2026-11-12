@@ -111,37 +111,63 @@ PAPER_BASE_PRICES=BTCUSD:65000,ETHUSD:3200
 
 ## Running
 
+Community Cloud always runs from the repository root, so run it the same way locally
+(`streamlit run` interprets most paths relative to the working directory):
+
 ```bash
-# Dashboard (24/7 monitoring)
-streamlit run app.py
+# From the repository root (matches Streamlit Community Cloud)
+streamlit run the5ers_bot/app.py
 
 # Headless single pass - useful as a smoke test or a cron entry point
-python app.py --once
+python the5ers_bot/app.py --once
 
-# Standalone broker connectivity check
-python broker_client.py
-
-# Kill switch logic demo
-python kill_switch.py
+# Standalone broker connectivity check / kill switch demo
+python the5ers_bot/broker_client.py
+python the5ers_bot/kill_switch.py
 ```
 
-### Cloud deployment (Hugging Face Spaces)
+If you `cd the5ers_bot` first, drop the folder prefix (`streamlit run app.py`).
 
-The dashboard is ready to run as a **Streamlit Space**:
+### Cloud deployment (Streamlit Community Cloud)
 
-1. Create a new Space → **SDK: Streamlit** → this `the5ers_bot` folder becomes the repo
-   root (`app.py`, `requirements.txt` and `.streamlit/config.toml` at the top level).
-2. Set secrets/env vars under **Settings → Variables and secrets** (`METAAPI_TOKEN`,
-   `METAAPI_ACCOUNT_ID`, or `PAPER_MODE=true` to demo the UI without credentials) —
-   or just type them into the sidebar at runtime.
-3. The bundled `.streamlit/config.toml` already runs the server **headless** on
-   `0.0.0.0:7860` with CORS/XSRF relaxed for the Space proxy, so no extra flags are
-   needed.
+The dashboard is ready to deploy on [Community Cloud](https://share.streamlit.io) from
+GitHub with **no code changes**:
 
-> **Caveat:** the kill-switch state file (`.state/`) and the background thread live on
-> the Space's ephemeral filesystem. For long-running keys use a **persistent** Space and
-> the dashboard's Reset button after a rebuild, or run on a VM if you need hard
-> state guarantees.
+1. Push this repository to GitHub (public, or private with the app granted access).
+2. On <https://share.streamlit.io> choose **Create app → Deploy a public app from
+   GitHub** and select your repository and branch.
+3. **Main file path:** `the5ers_bot/app.py`
+4. Under **Advanced settings → Secrets**, add either your MetaApi credentials …
+
+   ```toml
+   METAAPI_TOKEN = "your-metaapi-token"
+   METAAPI_ACCOUNT_ID = "your-account-id"
+   ```
+
+   … or set `PAPER_MODE = "true"` to demo the dashboard against the offline simulator.
+   You can also leave Secrets empty and type the credentials into the sidebar at
+   runtime — they are kept in the session only.
+5. Click **Deploy**. Community Cloud installs `the5ers_bot/requirements.txt` and reads
+   the configuration from the repository-root `.streamlit/config.toml`.
+
+**Why the nested layout works on Cloud:**
+
+* Community Cloud always runs from the **repository root**. `app.py` prepends its own
+  folder to `sys.path`, so `broker_client` and `kill_switch` import cleanly regardless
+  of the working directory.
+* The dependency file in the **entrypoint's directory** (`the5ers_bot/requirements.txt`)
+  takes precedence over the repository-root `requirements.txt`, so the TradingAgents
+  project's dependencies are ignored.
+* The configuration file **must be at the repository root** (`.streamlit/config.toml`);
+  an app-specific copy next to the entrypoint would override it. No port/host or
+  CORS/XSRF overrides are set, so nothing conflicts with the platform proxy.
+* Credentials resolve in this order: **sidebar inputs → `st.secrets` → environment
+  variables (`.env`)**. The "in effect" caption always shows which source won.
+
+> **State caveat:** Community Cloud containers are ephemeral and sleep when idle, so the
+> kill-switch state file (`.state/`) and the running background thread do not survive a
+> reboot or redeploy. Use Community Cloud for monitoring and supervised sessions; run on
+> a persistent VM if you need truly always-on trading and hard state guarantees.
 
 ### Safe first run
 
@@ -180,10 +206,11 @@ set `DRY_RUN=false`.
 * Enter your **MetaApi Token** (masked, password-style) and **MetaApi Account ID**
   directly in the dashboard, then press **Save credentials**.
 * Pressing **Start Bot** also picks up whatever is currently typed in those fields.
-* If a field is left **empty**, the bot falls back to `METAAPI_TOKEN` /
-  `METAAPI_ACCOUNT_ID` from `.env` — so both workflows are supported.
-* The caption under the inputs always shows what is **in effect** (token masked,
-  account id, and whether it came from the Dashboard or the Environment).
+* If a field is left **empty**, the bot falls back to `st.secrets` (Streamlit Community
+  Cloud Secrets) and then to `METAAPI_TOKEN` / `METAAPI_ACCOUNT_ID` from `.env` — so all
+  workflows are supported.
+* The caption under the inputs always shows what is **in effect** (token masked, account
+  id, and the winning source: Dashboard, Streamlit secrets, or Environment).
 * Credentials are held in the browser session's memory only and are **never written to
   disk**. They are applied on the next **Start Bot**; changing them while the bot is
   running shows a reminder to restart.
@@ -206,8 +233,10 @@ set `DRY_RUN=false`.
 
 ## Security notes
 
-* No credentials are hard-coded; they come from the dashboard inputs or environment
-  variables.
+* No credentials are hard-coded; they come from the dashboard inputs, `st.secrets`
+  (Cloud Secrets manager) or environment variables.
+* `app.py` keeps a single process-wide orchestrator, so Streamlit reruns and extra
+  browser sessions can never spawn duplicate background trading threads.
 * Dashboard-entered tokens live in Streamlit session memory only — they are never
   persisted to disk and never rendered back in full (always masked).
 * `.env` and `.state/` should be git-ignored — add them to your `.gitignore`.
