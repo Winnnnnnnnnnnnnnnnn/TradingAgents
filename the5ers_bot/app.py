@@ -691,11 +691,17 @@ class TradingOrchestrator:
             self._state["flattened_for_lock"] = False
 
         # --- signal generation + execution --------------------------------- #
+        # Track open positions tick-locally: the broker snapshot fetched above is
+        # stale once we start opening orders in this same iteration, so without a
+        # running count several symbols could fill and breach max_open_positions.
         open_symbols = {p.symbol for p in positions}
+        open_count = len(positions)
         for symbol in self.config.symbols:
             resolved = self._broker.resolve_symbol(symbol)
             if resolved in open_symbols:
                 continue
+            if open_count >= self.config.max_open_positions:
+                break
 
             frame = await self._market_agent.fetch_frame(symbol)
             if frame.empty:
@@ -730,6 +736,7 @@ class TradingOrchestrator:
             )
             if result.success:
                 open_symbols.add(risk.symbol)
+                open_count += 1
                 entry = self.kill_switch.status()
                 self.log_event(
                     f"Opened {signal.side.value.upper()} {risk.volume} {risk.symbol} @ {risk.entry_price} "

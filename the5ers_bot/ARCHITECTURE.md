@@ -344,21 +344,19 @@ class KillSwitch:
 
 ### High priority
 
-- **F-1 `max_open_positions` is not enforced within a single tick.** In `_tick`,
-  `positions` is fetched once and passed unchanged to every `RiskAgent.assess()` call,
-  while newly opened symbols are only tracked in a *local* `open_symbols` set. With more
-  symbols than `max_open_positions`, one tick can open one position per symbol. Fix: pass a
-  running count / extend the `positions` list as orders fill.
+- **F-1 ✅ RESOLVED — `max_open_positions` enforced within a tick.** `_tick()` now keeps a
+  tick-local `open_count` (seeded from the broker snapshot, incremented on each fill) and
+  stops iterating symbols once the cap is reached, so a single tick can no longer open one
+  position per symbol.
 
-- **F-2 Manual lock is cleared by the daily rollover.** `_rollover_if_needed()` resets
-  `locked=False` whenever the trading day changes, including a `MANUAL` lock — contradicting
-  the module docstring ("only clears on an explicit operator reset"). Fix: skip the
-  rollover reset for `MANUAL` (or re-apply it after rollover).
+- **F-2 ✅ RESOLVED — manual lock persists across the daily rollover.** `_rollover_if_needed()`
+  now captures and re-applies a `MANUAL` lock after resetting the daily baseline; only the
+  daily profit/loss locks reset at the day boundary. Clearing a manual lock still requires an
+  explicit `reset(force=True)`.
 
-- **F-3 Daily reset timezone defaults to UTC.** The5ers daily limits follow the *broker*
-  server day (typically GMT+2/+3), which is usually not UTC. A UTC rollover can reset the
-  baseline at the wrong moment and mis-measure the daily drawdown. Fix: set `DAILY_RESET_TZ`
-  to the broker server timezone.
+- **F-3 ✅ RESOLVED — broker timezone alignment.** `DAILY_RESET_TZ` drives the daily baseline
+  rollover (via `zoneinfo`); set it to the MetaTrader server timezone so the reset matches the
+  broker's trading day instead of UTC. Documented in `.env.example`.
 
 - **F-4 Ephemeral filesystem under Streamlit Cloud.** `.state/` lives on the container's
   local disk, which is wiped on restart/redeploy, so the day's baseline and any lock are

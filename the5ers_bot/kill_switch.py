@@ -252,6 +252,16 @@ class KillSwitch:
         if stored_day == today and self._state.get("day_start_balance") is not None:
             return False
 
+        # Lock 3 (manual) is sticky: it must survive the day boundary and only clear
+        # on an explicit operator reset. The profit/loss locks are daily by nature and
+        # do reset. Capture the manual lock before the rollover wipes the state.
+        sticky_manual = (
+            bool(self._state.get("locked"))
+            and self._state.get("lock_type") == KillLockType.MANUAL.value
+        )
+        manual_reason = self._state.get("lock_reason", "")
+        manual_locked_at = self._state.get("locked_at")
+
         LOGGER.info(
             "New trading day %s - resetting baseline to balance %.2f (previous day %s)",
             today, balance, stored_day,
@@ -270,6 +280,16 @@ class KillSwitch:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
         )
+        if sticky_manual:
+            self._state.update(
+                {
+                    "locked": True,
+                    "lock_type": KillLockType.MANUAL.value,
+                    "lock_reason": manual_reason or "Manual kill switch engaged by operator.",
+                    "locked_at": manual_locked_at or datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            LOGGER.warning("Manual lock preserved across day rollover into %s.", today)
         self._persist()
         return True
 
