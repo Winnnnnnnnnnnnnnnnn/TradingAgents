@@ -1,25 +1,28 @@
 # The5ers multi-agent trading bot - Python dependencies
 # Install with: pip install -r requirements.txt
 #
-# Pinned to exact versions for reproducible Linux builds on Streamlit Community
-# Cloud. No OS-specific packages are required (all wheels are manylinux-compatible).
+# Linux / Streamlit Community Cloud friendly: every package ships manylinux wheels
+# and none are OS-specific.
 
 # --- Broker connectivity ---------------------------------------------------- #
-metaapi-cloud-sdk==29.1.1          # MetaApi Cloud SDK (async MetaTrader 4/5 bridge)
+metaapi-cloud-sdk>=29.0.0          # MetaApi Cloud SDK (async MetaTrader 4/5 bridge)
 
 # --- Dashboard / orchestration ---------------------------------------------- #
-streamlit==1.57.0                  # Monitoring dashboard (already on Cloud; pinned for reproducibility)
-streamlit-autorefresh==1.0.1       # Periodic dashboard refresh (optional; degrades gracefully)
+streamlit>=1.37.0                  # Dashboard + native @st.fragment(run_every=...)
 
-# --- Data / analytics ------------------------------------------------------- #
-pandas==3.0.6                      # Candle frames, indicators, dashboard tables
-numpy==2.5.3                       # Numeric helpers for EMA / RSI / ATR
+# --- Data / analytics / charting -------------------------------------------- #
+pandas>=2.0.0                      # Candle frames, indicators, dashboard tables
+numpy>=1.24.0                      # Numeric helpers for EMA / RSI / ATR
+plotly>=5.22.0                     # Interactive candlestick + RSI dashboard chart
 
 # --- Utilities -------------------------------------------------------------- #
-python-dotenv==1.2.4               # Load credentials from .env
-requests==2.34.2                   # HTTP transport used by the MetaApi SDK
+python-dotenv>=1.0.0               # Load credentials from .env
 tzdata>=2024.1                     # IANA timezone database for the daily rollover
 
-# --- Optional extras -------------------------------------------------------- #
-# MetaTrader5>=5.0.45              # Local MT5 terminal bridge - WINDOWS ONLY, do NOT add for Cloud
-# plotly>=5.18.0                   # Add interactive equity charts to the dashboard
+# --- Sentinel Council (multi-LLM advisory layer) ---------------------------- #
+groq>=0.11.0                       # Scout counselor (llama-3.3-70b-versatile)
+google-genai>=1.0.0                # Risk Auditor counselor (gemini-2.5-flash)
+
+# NOTE: streamlit-autorefresh is intentionally NOT included. The dashboard uses
+# Streamlit's native @st.fragment(run_every=5) so live refresh never contends with
+# the ASGI websocket (which caused "Expected ASGI message 'http.response.start'").
