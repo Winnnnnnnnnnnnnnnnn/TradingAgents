@@ -1,0 +1,18 @@
+# Streamlit configuration for local runs and Streamlit Community Cloud.
+#
+# Community Cloud starts `streamlit run <entrypoint>` from the repository root and
+# manages the port, host and reverse proxy itself. This file therefore sets NO
+# `port`, `address`, `enableCORS` or `enableXsrfProtection` overrides: hardcoding a
+# port can conflict with the platform, and disabling CORS/XSRF weakens security.
+# Only presentation and telemetry are configured, plus `headless` so the server
+# never tries to open a browser or prompt for an email on a headless container.
+
+[theme]
+base = "dark"
+primaryColor = "#2e7d32"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

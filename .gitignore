@@ -215,6 +215,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# The5ers bot runtime state (kill-switch baseline/lock; Cloud cwd is the repo root)
+.state/
+
 # Cache
 **/data_cache/
 

@@ -1,5 +1,6 @@
 # Secrets - never commit
 .env
+.streamlit/secrets.toml
 
 # Runtime kill-switch state
 .state/
