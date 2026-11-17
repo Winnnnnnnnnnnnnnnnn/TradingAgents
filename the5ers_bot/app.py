@@ -476,11 +476,22 @@ class TradingOrchestrator:
         self.kill_switch = kill_switch or KillSwitch()
 
         # Credentials supplied at runtime from the dashboard. Empty values fall back
-        # to METAAPI_TOKEN / METAAPI_ACCOUNT_ID from the environment.
-        self._credentials: Dict[str, str] = {"token": "", "account_id": ""}
+        # to the environment / st.secrets. ``gemini_api_key`` / ``groq_api_key`` feed
+        # the Sentinel Council.
+        self._credentials: Dict[str, str] = {
+            "token": "",
+            "account_id": "",
+            "gemini_api_key": "",
+            "groq_api_key": "",
+        }
         # Effective credentials resolved ON THE UI THREAD and cached. The background
         # loop reads this copy so it never has to touch st.secrets / any st.* API.
-        self._resolved_credentials: Dict[str, str] = {"token": "", "account_id": ""}
+        self._resolved_credentials: Dict[str, str] = {
+            "token": "",
+            "account_id": "",
+            "gemini_api_key": "",
+            "groq_api_key": "",
+        }
 
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -493,11 +504,7 @@ class TradingOrchestrator:
         self._risk_agent: Optional[RiskAgent] = None
         self._execution_agent: Optional[ExecutionAgent] = None
 
-        self._council: Optional[Any] = (
-            SentinelCouncil(timeout=self.config.ai_council_timeout)
-            if (SentinelCouncil is not None and self.config.ai_council_enabled)
-            else None
-        )
+        self._council: Optional[Any] = self._build_council({})
 
         self._signals: Deque[Dict[str, Any]] = deque(maxlen=200)
         self._trades: Deque[Dict[str, Any]] = deque(maxlen=200)
@@ -539,21 +546,40 @@ class TradingOrchestrator:
             self._events.append(line)
         LOGGER.info(message)
 
-    def set_credentials(self, token: Optional[str] = None, account_id: Optional[str] = None) -> bool:
+    def set_credentials(
+        self,
+        token: Optional[str] = None,
+        account_id: Optional[str] = None,
+        gemini_api_key: Optional[str] = None,
+        groq_api_key: Optional[str] = None,
+    ) -> bool:
         """Store dashboard-supplied credentials for the next connection attempt.
 
-        Blank values are stored as empty strings, which makes ``BrokerClient``
-        fall back to ``METAAPI_TOKEN`` / ``METAAPI_ACCOUNT_ID`` from the
-        environment. Returns True when the stored values actually changed.
+        A ``None`` argument leaves the stored value untouched, while an empty
+        string explicitly clears it (so the fallback chain to ``st.secrets`` /
+        environment kicks in). Returns True when anything actually changed.
         """
-        token = (token or "").strip()
-        account_id = (account_id or "").strip()
         with self._lock:
-            changed = (token, account_id) != (self._credentials["token"], self._credentials["account_id"])
-            self._credentials = {"token": token, "account_id": account_id}
+            current = dict(self._credentials)
+            updated = dict(current)
+            if token is not None:
+                updated["token"] = token.strip()
+            if account_id is not None:
+                updated["account_id"] = account_id.strip()
+            if gemini_api_key is not None:
+                updated["gemini_api_key"] = gemini_api_key.strip()
+            if groq_api_key is not None:
+                updated["groq_api_key"] = groq_api_key.strip()
+            changed = updated != current
+            self._credentials = updated
         if changed:
-            source = "dashboard" if (token or account_id) else "environment"
-            self.log_event(f"Credentials updated (source: {source}). Restart the bot to apply them.")
+            broker_set = bool(updated["token"] or updated["account_id"])
+            ai_set = bool(updated["gemini_api_key"] or updated["groq_api_key"])
+            source = "dashboard" if (broker_set or ai_set) else "environment"
+            self.log_event(
+                f"Credentials updated (source: {source}; MetaApi={'set' if broker_set else 'env'}, "
+                f"AI={'set' if ai_set else 'env'}). Restart the bot to apply them."
+            )
         return changed
 
     def _effective_credentials(self) -> Dict[str, str]:
@@ -562,10 +588,22 @@ class TradingOrchestrator:
         UI thread only - it reads ``st.secrets``.
         """
         with self._lock:
-            ui_token, ui_account = self._credentials["token"], self._credentials["account_id"]
+            ui = dict(self._credentials)
         return {
-            "token": ui_token or _streamlit_secret("METAAPI_TOKEN") or os.getenv("METAAPI_TOKEN", "").strip(),
-            "account_id": ui_account or _streamlit_secret("METAAPI_ACCOUNT_ID") or os.getenv("METAAPI_ACCOUNT_ID", "").strip(),
+            "token": ui["token"] or _streamlit_secret("METAAPI_TOKEN") or os.getenv("METAAPI_TOKEN", "").strip(),
+            "account_id": ui["account_id"] or _streamlit_secret("METAAPI_ACCOUNT_ID") or os.getenv("METAAPI_ACCOUNT_ID", "").strip(),
+            "gemini_api_key": (
+                ui["gemini_api_key"]
+                or _streamlit_secret("GEMINI_API_KEY")
+                or _streamlit_secret("GOOGLE_API_KEY")
+                or os.getenv("GEMINI_API_KEY", "").strip()
+                or os.getenv("GOOGLE_API_KEY", "").strip()
+            ),
+            "groq_api_key": (
+                ui["groq_api_key"]
+                or _streamlit_secret("GROQ_API_KEY")
+                or os.getenv("GROQ_API_KEY", "").strip()
+            ),
         }
 
     def resolve_credentials(self) -> Dict[str, str]:
@@ -573,26 +611,51 @@ class TradingOrchestrator:
 
         The background trading thread must never touch ``st.*``; it reads this
         cached copy instead. Called from the dashboard before ``start()`` and from
-        the headless single-pass runner.
+        the headless single-pass runner. The Sentinel Council is (re)built here so
+        its ``status()`` reflects the dashboard-supplied keys before the loop runs.
         """
         resolved = self._effective_credentials()
         with self._lock:
             self._resolved_credentials = resolved
+            self._council = self._build_council(resolved)
         return resolved
 
+    def _build_council(self, creds: Dict[str, str]) -> Optional[Any]:
+        """Construct a ``SentinelCouncil`` from already-resolved credentials.
+
+        Pure: only uses the passed-in values, so it is safe on any thread (it never
+        reads ``st.*``).
+        """
+        if SentinelCouncil is None or not self.config.ai_council_enabled:
+            return None
+        return SentinelCouncil(
+            timeout=self.config.ai_council_timeout,
+            groq_api_key=creds.get("groq_api_key") or None,
+            gemini_api_key=creds.get("gemini_api_key") or None,
+            enabled=True,
+        )
+
     def credentials_info(self) -> Dict[str, Any]:
-        """Describe which credentials the bot would use, with the token masked."""
+        """Describe which credentials the bot would use (secrets are masked)."""
         with self._lock:
-            ui_token, ui_account = self._credentials["token"], self._credentials["account_id"]
+            ui = dict(self._credentials)
         secret_token = _streamlit_secret("METAAPI_TOKEN")
         secret_account = _streamlit_secret("METAAPI_ACCOUNT_ID")
+        secret_gemini = _streamlit_secret("GEMINI_API_KEY") or _streamlit_secret("GOOGLE_API_KEY")
+        secret_groq = _streamlit_secret("GROQ_API_KEY")
         env_token, env_account = os.getenv("METAAPI_TOKEN", "").strip(), os.getenv("METAAPI_ACCOUNT_ID", "").strip()
+        env_gemini = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+        env_groq = os.getenv("GROQ_API_KEY", "").strip()
         effective = self._effective_credentials()
         return {
             "token_masked": _mask(effective["token"]),
-            "token_source": _credential_source(ui_token, secret_token, env_token),
+            "token_source": _credential_source(ui["token"], secret_token, env_token),
             "account_id": effective["account_id"] or "(not set)",
-            "account_source": _credential_source(ui_account, secret_account, env_account),
+            "account_source": _credential_source(ui["account_id"], secret_account, env_account),
+            "gemini_set": bool(effective["gemini_api_key"]),
+            "gemini_source": _credential_source(ui["gemini_api_key"], secret_gemini, env_gemini),
+            "groq_set": bool(effective["groq_api_key"]),
+            "groq_source": _credential_source(ui["groq_api_key"], secret_groq, env_groq),
         }
 
     def start(self) -> bool:
@@ -691,6 +754,10 @@ class TradingOrchestrator:
         # Read the credentials cached by the UI thread; never call st.* here.
         with self._lock:
             creds = dict(self._resolved_credentials)
+
+        # (Re)build the Sentinel Council from the cached keys. The helper only uses
+        # values passed in here - no st.* / st.secrets access on this thread.
+        self._council = self._build_council(creds)
 
         # Bind the kill-switch state to this account: switching accounts must never
         # inherit another account's daily baseline or lock.
@@ -938,9 +1005,13 @@ class TradingOrchestrator:
         entry["side"] = signal.side.value.upper()
         with self._lock:
             self._council_feed.append(entry)
+        scout_model = entry.get("scout_model_used") or "-"
+        auditor_model = entry.get("auditor_model_used") or "-"
+        fallback = " [FALLBACK]" if entry.get("fallback_used") else ""
         self.log_event(
             f"Sentinel council: {entry.get('recommendation')} "
-            f"({entry.get('confidence', 0.0):.0%}) - {str(entry.get('summary', ''))[:140]}"
+            f"({entry.get('confidence', 0.0):.0%}) | scout={scout_model} auditor={auditor_model}{fallback}"
+            f" - {str(entry.get('summary', ''))[:120]}"
         )
 
     async def _flatten_all(self, reason: str) -> List[TradeResult]:
@@ -1199,9 +1270,11 @@ def _render_council(feed: List[Dict[str, Any]], status: Dict[str, Any]) -> None:
 
     scout_state = "on" if status.get("scout") else "off"
     auditor_state = "on" if status.get("auditor") else "off"
+    scout_chain = " -> ".join(status.get("scout_models", [status.get("scout_model", "-")]))
+    auditor_chain = " -> ".join(status.get("auditor_models", [status.get("auditor_model", "-")]))
     st.caption(
-        f"Scout (Groq · {status.get('scout_model', 'llama-3.3-70b-versatile')}): {scout_state} · "
-        f"Risk Auditor (Gemini · {status.get('auditor_model', 'gemini-2.5-flash')}): {auditor_state} · "
+        f"Scout (Groq): {scout_state} · cascade `{scout_chain}` · "
+        f"Risk Auditor (Gemini): {auditor_state} · cascade `{auditor_chain}` · "
         f"timeout {status.get('timeout', 0):g}s"
     )
     if not status.get("enabled"):
@@ -1211,11 +1284,14 @@ def _render_council(feed: List[Dict[str, Any]], status: Dict[str, Any]) -> None:
     for entry in reversed(feed[-40:]):
         scout = entry.get("scout") or {}
         auditor = entry.get("auditor") or {}
+        scout_model = entry.get("scout_model_used") or "—"
+        auditor_model = entry.get("auditor_model_used") or "—"
+        flag = " ⚠ FALLBACK" if entry.get("fallback_used") else ""
         lines.append(
             f"[{str(entry.get('timestamp', ''))[11:19]}Z] {entry.get('symbol', '')} {entry.get('side', '')} "
-            f"-> {entry.get('recommendation', 'neutral')} ({entry.get('confidence', 0.0):.0%}) "
-            f"| scout={scout.get('verdict', '-')} auditor={auditor.get('verdict', '-')} "
-            f"| {str(entry.get('summary', ''))[:120]}"
+            f"-> {entry.get('recommendation', 'neutral')} ({entry.get('confidence', 0.0):.0%}){flag} "
+            f"| scout={scout.get('verdict', '-')}@{scout_model} auditor={auditor.get('verdict', '-')}@{auditor_model} "
+            f"| {str(entry.get('summary', ''))[:110]}"
         )
     st.code("\n".join(lines) if lines else "No council activity yet.", language="text")
 
@@ -1285,6 +1361,44 @@ def _render_dashboard() -> None:
             f"account `{info['account_id']}` ({info['account_source']})"
         )
 
+    # ---- sidebar: Sentinel Council AI credentials ------------------------ #
+    st.session_state.setdefault("ui_gemini_key", "")
+    st.session_state.setdefault("ui_groq_key", "")
+
+    ai_info = snapshot["credentials"]
+    gemini_badge = "🟢 set" if ai_info.get("gemini_set") else "🔴 missing"
+    groq_badge = "🟢 set" if ai_info.get("groq_set") else "🔴 missing"
+    with st.sidebar.expander("🧠 Sentinel Council AI Credentials", expanded=False):
+        ai_flash = st.session_state.pop("ai_creds_flash", None)
+        if ai_flash:
+            st.success(ai_flash)
+        st.caption(
+            f"Gemini (Risk Auditor): **{gemini_badge}** · {ai_info.get('gemini_source', 'Missing')}  \n"
+            f"Groq (Scout): **{groq_badge}** · {ai_info.get('groq_source', 'Missing')}"
+        )
+        ui_gemini = st.text_input(
+            "Gemini API Key",
+            key="ui_gemini_key",
+            type="password",
+            placeholder="leave empty to use secrets/.env",
+            help="Risk Auditor model cascade. Held in this browser session only - never written to disk.",
+        )
+        ui_groq = st.text_input(
+            "Groq API Key",
+            key="ui_groq_key",
+            type="password",
+            placeholder="leave empty to use secrets/.env",
+            help="Scout model cascade. Held in this browser session only - never written to disk.",
+        )
+        if st.button("💾 Save AI credentials", use_container_width=True):
+            orchestrator.set_credentials(gemini_api_key=ui_gemini, groq_api_key=ui_groq)
+            st.session_state["ai_creds_flash"] = (
+                "Saved. Stop and Start the bot to apply them."
+                if orchestrator.is_running
+                else "AI credentials saved."
+            )
+            st.rerun()
+
     # ---- sidebar: controls ----------------------------------------------- #
     st.sidebar.header("🎛️ Controls")
     bot_flash = st.session_state.pop("bot_flash", None)
@@ -1299,7 +1413,10 @@ def _render_dashboard() -> None:
         if st.sidebar.button("▶ Start Bot", use_container_width=True, type="primary"):
             # Credentials are resolved on this (UI) thread and handed to the loop.
             orchestrator.set_credentials(
-                st.session_state.get("ui_token", ""), st.session_state.get("ui_account_id", "")
+                st.session_state.get("ui_token", ""),
+                st.session_state.get("ui_account_id", ""),
+                st.session_state.get("ui_gemini_key", ""),
+                st.session_state.get("ui_groq_key", ""),
             )
             started = orchestrator.start()
             # Wait briefly so the loop can connect before the dashboard re-renders,

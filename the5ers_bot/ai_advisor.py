@@ -6,20 +6,32 @@ ai_advisor.py
 Two independent counselors review each setup and their opinions are blended into a
 single ``CouncilVerdict``:
 
-* **Scout**        - Groq ``llama-3.3-70b-versatile``: technical momentum and chart
-                     structure (trend, EMA slope, RSI posture, ATR context).
-* **Risk Auditor** - Google Gemini ``gemini-2.5-flash``: The5ers prop-firm rule
-                     compliance (-$100 daily stop, +$60 daily target, strict 1:3
-                     minimum reward:risk floor).
+* **Scout**        - Groq: technical momentum and chart structure (trend, EMA
+                     slope, RSI posture, ATR context).
+* **Risk Auditor** - Google Gemini: The5ers prop-firm rule compliance (-$100 daily
+                     stop, +$60 daily target, strict 1:3 minimum reward:risk floor).
+
+Model cascade
+-------------
+Each counselor walks a prioritised list of models and moves to the next one on any
+API error, rate-limit or timeout:
+
+* Scout (Groq)        : ``openai/gpt-oss-120b`` -> ``qwen/qwen3.8-27b`` -> ``openai/gpt-oss-20b``
+* Risk Auditor (Gemini): ``gemini-2.5-flash`` -> ``gemini-2.5-flash-lite`` -> ``gemini-3.8-flash``
+
+The whole cascade shares a single hard deadline (``DEFAULT_TIMEOUT`` = 8s), so a
+deliberation can never overrun and block the trading loop. Which model actually
+answered is recorded on the verdict (``scout_model_used`` / ``auditor_model_used``)
+plus a ``fallback_used`` flag for dashboard telemetry.
 
 Design contract
 ---------------
 The council is **advisory only** and must never block, delay, or crash the trading
 loop:
 
-* every network call is bounded by a hard timeout (default ``DEFAULT_TIMEOUT`` = 8s);
+* every network call is bounded by the shared hard timeout;
 * any failure - missing API key, SDK not installed, network error, malformed JSON -
-  fails **open** with ``degraded=True`` and a neutral recommendation;
+  fails **open** with ``approved=True``, ``degraded=True`` and a neutral read;
 * ``deliberate()`` never raises.
 
 Credentials are read from ``GROQ_API_KEY`` and ``GEMINI_API_KEY`` (or
@@ -33,17 +45,33 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 LOGGER = logging.getLogger("the5ers.council")
 
-# A hard ceiling so a slow/hanging LLM can never stall a trading tick.
+# A hard ceiling so a slow/hanging LLM can never stall a trading tick. The whole
+# model cascade for a counselor shares this single deadline.
 DEFAULT_TIMEOUT = 8.0
 
-SCOUT_MODEL = "llama-3.3-70b-versatile"
-AUDITOR_MODEL = "gemini-2.5-flash"
+# Groq Scout cascade (in order of preference).
+SCOUT_MODELS: List[str] = [
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-20b",
+]
+# Gemini Risk Auditor cascade (in order of preference).
+AUDITOR_MODELS: List[str] = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3.8-flash",
+]
+
+# Primary models, kept for display / backward compatibility.
+SCOUT_MODEL = SCOUT_MODELS[0]
+AUDITOR_MODEL = AUDITOR_MODELS[0]
 
 VALID_VERDICTS = {"bullish", "bearish", "neutral"}
 
@@ -132,6 +160,10 @@ class CounselorOpinion:
     ok: bool = False
     error: str = ""
     raw: str = ""
+    # True when the primary model failed and a fallback model answered.
+    fallback: bool = False
+    # Every model the cascade attempted, in order (telemetry).
+    attempted: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -148,6 +180,12 @@ class CouncilVerdict:
     auditor: Optional[CounselorOpinion] = None
     consensus: bool = False
     degraded: bool = True
+    # Fail-open by default: the council only ever advises, never blocks.
+    approved: bool = True
+    # Which exact model answered for each provider (empty when the provider failed).
+    scout_model_used: str = ""
+    auditor_model_used: str = ""
+    fallback_used: bool = False
     elapsed_ms: int = 0
     messages: List[str] = field(default_factory=list)
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -159,6 +197,10 @@ class CouncilVerdict:
             "summary": self.summary,
             "consensus": self.consensus,
             "degraded": self.degraded,
+            "approved": self.approved,
+            "scout_model_used": self.scout_model_used,
+            "auditor_model_used": self.auditor_model_used,
+            "fallback_used": self.fallback_used,
             "elapsed_ms": self.elapsed_ms,
             "messages": list(self.messages),
             "timestamp": self.timestamp,
@@ -171,7 +213,7 @@ class CouncilVerdict:
 # The council
 # --------------------------------------------------------------------------- #
 class SentinelCouncil:
-    """Asynchronous multi-LLM advisory council. Fail-open by construction."""
+    """Asynchronous multi-LLM advisory council with model fallback. Fail-open."""
 
     def __init__(
         self,
@@ -179,6 +221,8 @@ class SentinelCouncil:
         groq_api_key: Optional[str] = None,
         gemini_api_key: Optional[str] = None,
         enabled: bool = True,
+        scout_models: Optional[Sequence[str]] = None,
+        auditor_models: Optional[Sequence[str]] = None,
     ) -> None:
         self.timeout = float(timeout) if timeout and timeout > 0 else DEFAULT_TIMEOUT
         self._groq_key = (groq_api_key or os.getenv("GROQ_API_KEY", "")).strip()
@@ -188,6 +232,8 @@ class SentinelCouncil:
             or os.getenv("GOOGLE_API_KEY", "")
         ).strip()
         self.enabled = bool(enabled)
+        self.scout_models: List[str] = list(scout_models) if scout_models else list(SCOUT_MODELS)
+        self.auditor_models: List[str] = list(auditor_models) if auditor_models else list(AUDITOR_MODELS)
         self._groq_client: Any = None
         self._gemini_client: Any = None
 
@@ -207,8 +253,10 @@ class SentinelCouncil:
             "enabled": self.enabled,
             "scout": self.scout_available,
             "auditor": self.auditor_available,
-            "scout_model": SCOUT_MODEL,
-            "auditor_model": AUDITOR_MODEL,
+            "scout_model": self.scout_models[0],
+            "auditor_model": self.auditor_models[0],
+            "scout_models": list(self.scout_models),
+            "auditor_models": list(self.auditor_models),
             "timeout": self.timeout,
         }
 
@@ -218,9 +266,10 @@ class SentinelCouncil:
     async def deliberate(self, context: Dict[str, Any]) -> CouncilVerdict:
         """Ask both counselors in parallel and blend their opinions.
 
-        Never raises: every failure path returns a ``degraded`` verdict with a
-        neutral recommendation so the caller can proceed unimpeded.
+        Never raises: every failure path returns a ``degraded``, ``approved``
+        verdict with a neutral recommendation so the caller can proceed.
         """
+        started = time.monotonic()
         verdict = CouncilVerdict()
         if not self.enabled:
             verdict.messages.append("Council disabled.")
@@ -232,15 +281,17 @@ class SentinelCouncil:
             coros.append(self._call_scout(context))
             labels.append("scout")
         else:
-            verdict.messages.append("Scout offline (no GROQ_API_KEY).")
+            verdict.messages.append("Scout offline (no Groq API key).")
         if self.auditor_available:
             coros.append(self._call_auditor(context))
             labels.append("auditor")
         else:
-            verdict.messages.append("Risk Auditor offline (no GEMINI_API_KEY).")
+            verdict.messages.append("Risk Auditor offline (no Gemini API key).")
 
         if not coros:
             verdict.messages.append("Council inert: no provider configured.")
+            self._blend(verdict)
+            verdict.elapsed_ms = int((time.monotonic() - started) * 1000)
             return verdict
 
         try:
@@ -248,6 +299,8 @@ class SentinelCouncil:
         except Exception as exc:  # pragma: no cover - gather itself shouldn't raise
             LOGGER.warning("Council gather failed open: %s", exc)
             verdict.messages.append(f"Council error: {exc}")
+            self._blend(verdict)
+            verdict.elapsed_ms = int((time.monotonic() - started) * 1000)
             return verdict
 
         for label, result in zip(labels, results):
@@ -259,8 +312,11 @@ class SentinelCouncil:
                 verdict.scout = result
             else:
                 verdict.auditor = result
+            if not result.ok:
+                verdict.messages.append(f"{label} unavailable: {result.error or 'unknown error'}")
 
         self._blend(verdict)
+        verdict.elapsed_ms = int((time.monotonic() - started) * 1000)
         return verdict
 
     # ------------------------------------------------------------------ #
@@ -268,20 +324,48 @@ class SentinelCouncil:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _blend(verdict: CouncilVerdict) -> None:
+        if verdict.scout is not None and verdict.scout.ok:
+            verdict.scout_model_used = verdict.scout.model
+        if verdict.auditor is not None and verdict.auditor.ok:
+            verdict.auditor_model_used = verdict.auditor.model
+
         opinions = [o for o in (verdict.scout, verdict.auditor) if o is not None and o.ok]
         if not opinions:
+            # Fail-open: both providers failed (or only one was configured and it
+            # failed) - the deterministic rules still govern trading.
             verdict.degraded = True
+            verdict.approved = True
             verdict.recommendation = "neutral"
             verdict.confidence = 0.0
             verdict.summary = "Council unavailable - proceeding on the deterministic rules."
             return
 
         verdict.degraded = len(opinions) < 2
+        verdict.fallback_used = any(o.fallback for o in opinions)
+        for opinion in opinions:
+            if opinion.fallback:
+                verdict.messages.append(
+                    f"{opinion.role}: primary model failed, fallback '{opinion.model}' answered."
+                )
+
         # Risk dominates: prefer the auditor's view when both speak.
         primary = next((o for o in opinions if o.role == "Risk Auditor"), opinions[-1])
         verdict.recommendation = primary.verdict
         verdict.confidence = sum(o.confidence for o in opinions) / len(opinions)
         verdict.summary = primary.summary or opinions[0].summary
+
+        # Fail-open: only an explicit, auditor-checked "no" revokes approval.
+        auditor = verdict.auditor
+        if auditor is not None and auditor.ok and auditor.compliant is False:
+            verdict.approved = False
+            verdict.messages.append("Risk Auditor flagged a compliance breach.")
+        else:
+            verdict.approved = True
+
+        if verdict.scout_model_used:
+            verdict.messages.append(f"Scout answered with '{verdict.scout_model_used}'.")
+        if verdict.auditor_model_used:
+            verdict.messages.append(f"Risk Auditor answered with '{verdict.auditor_model_used}'.")
 
         votes = {o.verdict for o in opinions}
         verdict.consensus = len(votes) == 1
@@ -291,46 +375,114 @@ class SentinelCouncil:
             verdict.messages.append("Council split - recommendation follows the Risk Auditor.")
 
     # ------------------------------------------------------------------ #
-    # Counselors
+    # Counselors (model cascades)
     # ------------------------------------------------------------------ #
     async def _call_scout(self, context: Dict[str, Any]) -> CounselorOpinion:
+        return await self._run_cascade(
+            role="Scout",
+            provider="groq",
+            models=self.scout_models,
+            make_call=lambda model: self._scout_once(model, context),
+        )
+
+    async def _call_auditor(self, context: Dict[str, Any]) -> CounselorOpinion:
+        return await self._run_cascade(
+            role="Risk Auditor",
+            provider="gemini",
+            models=self.auditor_models,
+            make_call=lambda model: self._auditor_once(model, context),
+        )
+
+    async def _run_cascade(
+        self,
+        role: str,
+        provider: str,
+        models: Sequence[str],
+        make_call: Callable[[str], Awaitable[CounselorOpinion]],
+    ) -> CounselorOpinion:
+        """Try each model in ``models`` in order under a single hard deadline.
+
+        The entire cascade shares ``self.timeout`` seconds: each attempt gets an
+        equal slice of the remaining budget, so a slow primary still leaves the
+        fallbacks a chance while the total can never overrun the deadline. Never
+        raises - returns a failed ``CounselorOpinion`` when every model fails.
+        """
+        cascade = list(models) or [""]
+        deadline = time.monotonic() + self.timeout
+        attempted: List[str] = []
+        last_error = ""
+
+        for index, model in enumerate(cascade):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = last_error or "time budget exhausted"
+                break
+            # Give every remaining model an equal slice so the whole cascade is
+            # attempted and still fits inside the shared deadline.
+            budget = remaining / max(1, len(cascade) - index)
+            attempted.append(model)
+            try:
+                opinion = await asyncio.wait_for(make_call(model), timeout=budget)
+            except asyncio.TimeoutError:
+                last_error = f"{model}: timed out after {budget:.1f}s"
+                LOGGER.warning("%s model '%s' timed out; trying next fallback.", role, model)
+                continue
+            except Exception as exc:  # noqa: BLE001 - any provider error falls through
+                last_error = f"{model}: {exc}"
+                LOGGER.warning("%s model '%s' failed (%s); trying next fallback.", role, model, exc)
+                continue
+            if not isinstance(opinion, CounselorOpinion):
+                last_error = f"{model}: malformed counselor response"
+                continue
+
+            opinion.model = model
+            opinion.attempted = list(attempted)
+            opinion.fallback = index > 0
+            if index > 0:
+                LOGGER.info("%s recovered on fallback model '%s'.", role, model)
+            return opinion
+
+        return CounselorOpinion(
+            role=role,
+            provider=provider,
+            model=cascade[0],
+            ok=False,
+            error=last_error or "no model available",
+            attempted=list(attempted),
+        )
+
+    async def _scout_once(self, model: str, context: Dict[str, Any]) -> CounselorOpinion:
         if self._groq_client is None:
             from groq import AsyncGroq  # lazy import keeps the module import-safe
 
             self._groq_client = AsyncGroq(api_key=self._groq_key)
-        response = await asyncio.wait_for(
-            self._groq_client.chat.completions.create(
-                model=SCOUT_MODEL,
-                messages=[
-                    {"role": "system", "content": _SCOUT_SYSTEM},
-                    {"role": "user", "content": _format_context(context)},
-                ],
-                temperature=0.2,
-                max_tokens=400,
-            ),
-            timeout=self.timeout,
+        response = await self._groq_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _SCOUT_SYSTEM},
+                {"role": "user", "content": _format_context(context)},
+            ],
+            temperature=0.2,
+            max_tokens=400,
         )
         text = ""
         try:
             text = response.choices[0].message.content or ""
         except (AttributeError, IndexError, TypeError):
             text = ""
-        return _opinion_from_text("Scout", "groq", SCOUT_MODEL, text)
+        return _opinion_from_text("Scout", "groq", model, text)
 
-    async def _call_auditor(self, context: Dict[str, Any]) -> CounselorOpinion:
+    async def _auditor_once(self, model: str, context: Dict[str, Any]) -> CounselorOpinion:
         if self._gemini_client is None:
             from google import genai  # lazy import keeps the module import-safe
 
             self._gemini_client = genai.Client(api_key=self._gemini_key)
-        response = await asyncio.wait_for(
-            self._gemini_client.aio.models.generate_content(
-                model=AUDITOR_MODEL,
-                contents=f"{_AUDITOR_SYSTEM}\n\n{_format_context(context)}",
-            ),
-            timeout=self.timeout,
+        response = await self._gemini_client.aio.models.generate_content(
+            model=model,
+            contents=f"{_AUDITOR_SYSTEM}\n\n{_format_context(context)}",
         )
         text = getattr(response, "text", "") or ""
-        return _opinion_from_text("Risk Auditor", "gemini", AUDITOR_MODEL, text)
+        return _opinion_from_text("Risk Auditor", "gemini", model, text)
 
 
 def _opinion_from_text(role: str, provider: str, model: str, text: str) -> CounselorOpinion:
@@ -369,5 +521,7 @@ __all__ = [
     "CounselorOpinion",
     "SCOUT_MODEL",
     "AUDITOR_MODEL",
+    "SCOUT_MODELS",
+    "AUDITOR_MODELS",
     "DEFAULT_TIMEOUT",
 ]
