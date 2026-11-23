@@ -38,9 +38,13 @@ model on any API error, rate-limit or timeout:
 * Scout (Groq)         : ``openai/gpt-oss-120b`` -> ``qwen/qwen3.8-27b`` -> ``openai/gpt-oss-20b``
 * Risk Auditor (Gemini): ``gemini-2.5-flash`` -> ``gemini-2.5-flash-lite`` -> ``gemini-3.8-flash``
 
-The whole cascade shares one hard deadline (``DEFAULT_TIMEOUT`` = 8s). If a provider
-dies outright the survivor carries the verdict; if both fail (or keys are absent)
-the council fails open and the deterministic :class:`RiskEngine` alone decides.
+The Scout cascade runs under one hard deadline (``DEFAULT_TIMEOUT`` = 8s); the Gemini
+Risk Auditor gets its own, far more generous budget (``AUDITOR_TIMEOUT`` = 30s) and a
+model fallback chain, so a spiky or transiently-unavailable ``generate_content`` call
+is retried against the next Gemini model instead of being cut off prematurely or
+marked unavailable. If a provider dies outright the survivor carries the verdict; if
+both fail (or keys are absent) the council fails open and the deterministic
+:class:`RiskEngine` alone decides.
 """
 
 from __future__ import annotations
@@ -59,6 +63,13 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 LOGGER = logging.getLogger("copilot.council")
 
 DEFAULT_TIMEOUT = 8.0
+
+# The Gemini Risk Auditor gets its own, far more generous request budget: Gemini's
+# ``generate_content`` latency is spikier than Groq's and it can surface transient
+# 503 UNAVAILABLE / rate-limit errors. The shared DEFAULT_TIMEOUT/len(cascade) split
+# used to hand each auditor model only ~2.5s and timed out prematurely; 30s lets a
+# single Gemini request finish comfortably before the cascade falls back.
+AUDITOR_TIMEOUT = 30.0
 
 # --------------------------------------------------------------------------- #
 # Risk rules - The5ers Bootcamp ($5,000 demo, scaling to $20,000)
@@ -501,8 +512,12 @@ class SentinelCouncil:
         scout_models: Optional[Sequence[str]] = None,
         auditor_models: Optional[Sequence[str]] = None,
         risk_engine: Optional[RiskEngine] = None,
+        auditor_timeout: float = AUDITOR_TIMEOUT,
     ) -> None:
         self.timeout = float(timeout) if timeout and timeout > 0 else DEFAULT_TIMEOUT
+        self.auditor_timeout = (
+            float(auditor_timeout) if auditor_timeout and auditor_timeout > 0 else AUDITOR_TIMEOUT
+        )
         self._groq_key = (groq_api_key or os.getenv("GROQ_API_KEY", "")).strip()
         self._gemini_key = (
             gemini_api_key or os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
@@ -535,6 +550,7 @@ class SentinelCouncil:
             "scout_models": list(self.scout_models),
             "auditor_models": list(self.auditor_models),
             "timeout": self.timeout,
+            "auditor_timeout": self.auditor_timeout,
         }
 
     def configure(self, groq_api_key: Optional[str] = None, gemini_api_key: Optional[str] = None) -> None:
@@ -564,7 +580,9 @@ class SentinelCouncil:
         """Blocking wrapper for Streamlit. Always returns within ~timeout + margin."""
         try:
             runner = self._ensure_runner()
-            return runner.run(self.deliberate(setup), timeout=self.timeout + 3.0)
+            auditor_window = self.auditor_timeout * max(1, len(self.auditor_models))
+            margin = max(self.timeout, auditor_window) + 3.0
+            return runner.run(self.deliberate(setup), timeout=margin)
         except Exception as exc:  # noqa: BLE001 - never let the UI crash
             LOGGER.warning("council evaluate failed open: %s", exc)
             verdict = CouncilVerdict()
@@ -697,8 +715,18 @@ class SentinelCouncil:
         )
 
     async def _call_auditor(self, setup: Dict[str, Any]) -> CounselorOpinion:
+        # Dedicated, generous budget: each Gemini request may run up to
+        # AUDITOR_TIMEOUT (30s) and, on a 503 UNAVAILABLE / rate-limit / timeout /
+        # any error, the cascade automatically falls through to the next Gemini
+        # model before the auditor is marked unavailable. The cascade window is the
+        # per-request budget times the number of models so a hung primary still
+        # leaves time for its fallbacks.
+        cascade_window = self.auditor_timeout * max(1, len(self.auditor_models))
         return await self._run_cascade(
-            "Risk Auditor", "gemini", self.auditor_models, lambda m: self._auditor_once(m, setup)
+            "Risk Auditor", "gemini", self.auditor_models,
+            lambda m: self._auditor_once(m, setup),
+            timeout=cascade_window,
+            per_call_timeout=self.auditor_timeout,
         )
 
     async def _run_cascade(
@@ -707,10 +735,18 @@ class SentinelCouncil:
         provider: str,
         models: Sequence[str],
         make_call: Callable[[str], Awaitable[CounselorOpinion]],
+        timeout: Optional[float] = None,
+        per_call_timeout: Optional[float] = None,
     ) -> CounselorOpinion:
-        """Try each model in order under one shared hard deadline. Never raises."""
+        """Try each model in order under one shared hard deadline. Never raises.
+
+        ``timeout`` overrides the shared deadline (defaults to ``self.timeout``).
+        ``per_call_timeout``, when set, caps each attempt at that many seconds
+        rather than splitting the deadline evenly across the remaining models -
+        used to give the Gemini Risk Auditor its full 10s request budget.
+        """
         cascade = list(models) or [""]
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + (timeout if timeout and timeout > 0 else self.timeout)
         attempted: List[str] = []
         last_error = ""
 
@@ -719,7 +755,10 @@ class SentinelCouncil:
             if remaining <= 0:
                 last_error = last_error or "time budget exhausted"
                 break
-            budget = remaining / max(1, len(cascade) - index)
+            if per_call_timeout and per_call_timeout > 0:
+                budget = min(remaining, per_call_timeout)
+            else:
+                budget = remaining / max(1, len(cascade) - index)
             attempted.append(model)
             try:
                 opinion = await asyncio.wait_for(make_call(model), timeout=budget)
@@ -805,10 +844,40 @@ def _clamp_confidence(value: Any) -> float:
     return max(0.0, min(1.0, number))
 
 
+def _format_market(market: Dict[str, Any]) -> str:
+    """Render the :func:`data_fetcher.market_context` snapshot into a readable block."""
+    scope = [str(x) for x in (market.get("symbol"), market.get("timeframe")) if x]
+    title = "Market snapshot" + (f" ({', '.join(scope)})" if scope else "")
+    lines = [f"{title}:"]
+
+    quotes = [f"{k}={market[k]}" for k in ("bid", "ask", "spread") if market.get(k) is not None]
+    if quotes:
+        lines.append("- quotes: " + ", ".join(quotes) + "  [retail FX has no orderbook depth]")
+
+    indicators = market.get("indicators") or {}
+    if indicators:
+        lines.append("- indicators: " + ", ".join(f"{k}={v}" for k, v in indicators.items()))
+
+    candles = market.get("recent_candles") or []
+    if candles:
+        lines.append(f"- recent OHLCV candles (last {len(candles)}, oldest -> newest):")
+        for c in candles:
+            lines.append(
+                f"    {c.get('time', '')}  O={c.get('open')} H={c.get('high')} "
+                f"L={c.get('low')} C={c.get('close')} V={c.get('volume')}"
+            )
+    return "\n".join(lines)
+
+
 def _format_setup(setup: Dict[str, Any]) -> str:
-    return "Trade setup under review:\n" + "\n".join(
-        f"- {k}: {v}" for k, v in setup.items() if v is not None and k not in {"now", "spec"}
-    )
+    skip = {"now", "spec", "market"}
+    lines = ["Trade setup under review:"]
+    lines += [f"- {k}: {v}" for k, v in setup.items() if v is not None and k not in skip]
+    market = setup.get("market")
+    if isinstance(market, dict) and market:
+        lines.append("")
+        lines.append(_format_market(market))
+    return "\n".join(lines)
 
 
 def _opinion_from_text(role: str, provider: str, model: str, text: str) -> CounselorOpinion:
@@ -846,6 +915,7 @@ __all__ = [
     "SCOUT_MODELS",
     "AUDITOR_MODELS",
     "DEFAULT_TIMEOUT",
+    "AUDITOR_TIMEOUT",
     "ACCOUNT_SIZE_USD",
     "ACCOUNT_SIZE_MAX_USD",
     "RISK_PER_TRADE_USD",
