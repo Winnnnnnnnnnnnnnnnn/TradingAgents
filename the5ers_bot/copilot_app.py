@@ -14,9 +14,10 @@ Design
 ------
 * **Data** - :mod:`data_fetcher` attaches to the **local** MT5 terminal via
   ``mt5.initialize()``. No token, no cloud, no API key. Live ticks + historical
-  OHLCV for EURUSD / GBPUSD / USDJPY / XAUUSD. If the package is unavailable
-  (non-Windows) or the terminal is closed, it flips to a clearly-labelled offline
-  simulator so the dashboard never crashes.
+  OHLCV for FX majors/crosses (EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, USDCHF,
+  EURJPY, GBPJPY) and commodities (XAUUSD, XAGUSD, USOIL/WTI). If the package is
+  unavailable (non-Windows) or the terminal is closed, it flips to a clearly-labelled
+  offline simulator so the dashboard never crashes.
 * **Sentinel Council** - :class:`sentinel_council.RiskEngine` is the deterministic,
   authoritative gate; the optional Groq *Scout* + Gemini *Risk Auditor* LLMs add a
   plain-English opinion and fail **open**.
@@ -71,10 +72,16 @@ LOGGER = logging.getLogger("copilot.app")
 # --------------------------------------------------------------------------- #
 # Dashboard defaults
 # --------------------------------------------------------------------------- #
-PAIRS: List[str] = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+PAIRS: List[str] = [
+    # FX majors & crosses
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "EURJPY", "GBPJPY",
+    # Commodities (metals & energy CFDs)
+    "XAUUSD", "XAGUSD", "USOIL", "WTI",
+]
 DEFAULT_SYMBOL = "EURUSD"
 DEFAULT_TIMEFRAME = "15m"
 CANDLES = 300
+EMA_SHORT = 20
 EMA_FAST = 50
 EMA_SLOW = 200
 RSI_PERIOD = 14
@@ -113,6 +120,7 @@ def build_setup(
     stop_atr_mult: float = DEFAULT_STOP_ATR,
     target_rrr: float = DEFAULT_TARGET_RRR,
     profit_target: float = DEFAULT_PROFIT_TARGET,
+    ema_short: int = EMA_SHORT,
     ema_fast: int = EMA_FAST,
     ema_slow: int = EMA_SLOW,
     rsi_period: int = RSI_PERIOD,
@@ -155,7 +163,8 @@ def build_setup(
         "take_profit": round(tp, spec.digits),
         "market": market_context(
             df, tick, symbol=symbol, timeframe=timeframe, bars=MARKET_BARS,
-            digits=spec.digits, ema_fast=ema_fast, ema_slow=ema_slow, rsi_period=rsi_period,
+            digits=spec.digits, ema_short=ema_short, ema_fast=ema_fast, ema_slow=ema_slow,
+            rsi_period=rsi_period,
         ),
         "value_per_unit": spec.value_per_price_unit_per_lot,
         "min_lot": spec.min_lot,
@@ -175,6 +184,7 @@ def indicator_snapshot(df: pd.DataFrame) -> Dict[str, float]:
     last = df.iloc[-1]
     return {
         "close": float(last["close"]),
+        f"ema{EMA_SHORT}": float(last.get(f"ema{EMA_SHORT}", last["close"])),
         f"ema{EMA_FAST}": float(last.get(f"ema{EMA_FAST}", last["close"])),
         f"ema{EMA_SLOW}": float(last.get(f"ema{EMA_SLOW}", last["close"])),
         f"rsi{RSI_PERIOD}": float(last.get(f"rsi{RSI_PERIOD}", 50.0)),
@@ -498,12 +508,13 @@ def render_market_intelligence(df: pd.DataFrame, symbol: str, digits: int) -> No
     if not snapshot:
         st.warning("No candle data available for this symbol yet.")
         return
-    m = st.columns(5)
+    m = st.columns(6)
     m[0].metric("Close", f"{snapshot['close']:.{digits}f}")
-    m[1].metric(f"EMA{EMA_FAST}", f"{snapshot[f'ema{EMA_FAST}']:.{digits}f}")
-    m[2].metric(f"EMA{EMA_SLOW}", f"{snapshot[f'ema{EMA_SLOW}']:.{digits}f}")
-    m[3].metric(f"RSI{RSI_PERIOD}", f"{snapshot[f'rsi{RSI_PERIOD}']:.1f}")
-    m[4].metric("ATR14", f"{snapshot['atr14']:.{digits}f}")
+    m[1].metric(f"EMA{EMA_SHORT}", f"{snapshot[f'ema{EMA_SHORT}']:.{digits}f}")
+    m[2].metric(f"EMA{EMA_FAST}", f"{snapshot[f'ema{EMA_FAST}']:.{digits}f}")
+    m[3].metric(f"EMA{EMA_SLOW}", f"{snapshot[f'ema{EMA_SLOW}']:.{digits}f}")
+    m[4].metric(f"RSI{RSI_PERIOD}", f"{snapshot[f'rsi{RSI_PERIOD}']:.1f}")
+    m[5].metric("ATR14", f"{snapshot['atr14']:.{digits}f}")
 
     trend = "UPTREND" if snapshot[f"ema{EMA_FAST}"] > snapshot[f"ema{EMA_SLOW}"] else "DOWNTREND"
     st.caption(f"Bias: **{trend}** (EMA{EMA_FAST} vs EMA{EMA_SLOW}) · RSI{RSI_PERIOD} {snapshot[f'rsi{RSI_PERIOD}']:.1f}")
@@ -524,6 +535,8 @@ def render_market_intelligence(df: pd.DataFrame, symbol: str, digits: int) -> No
             ),
             row=1, col=1,
         )
+        fig.add_trace(go.Scatter(x=view["time"], y=view[f"ema{EMA_SHORT}"], name=f"EMA{EMA_SHORT}",
+                                 line=dict(color="#26c6da", width=1.2)), row=1, col=1)
         fig.add_trace(go.Scatter(x=view["time"], y=view[f"ema{EMA_FAST}"], name=f"EMA{EMA_FAST}",
                                  line=dict(color="#42a5f5", width=1.4)), row=1, col=1)
         fig.add_trace(go.Scatter(x=view["time"], y=view[f"ema{EMA_SLOW}"], name=f"EMA{EMA_SLOW}",

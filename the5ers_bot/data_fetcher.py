@@ -39,8 +39,13 @@ import pandas as pd
 
 LOGGER = logging.getLogger("copilot.mt5")
 
-# Default watchlist - the four instruments requested for the co-pilot.
-DEFAULT_SYMBOLS: List[str] = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+# Default watchlist - FX majors/crosses plus metals & energy CFDs.
+DEFAULT_SYMBOLS: List[str] = [
+    # FX majors & crosses
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "EURJPY", "GBPJPY",
+    # Commodities
+    "XAUUSD", "XAGUSD", "USOIL",
+]
 
 # User-facing timeframe -> ``MetaTrader5`` constant name.
 TIMEFRAMES: Dict[str, str] = {
@@ -111,22 +116,44 @@ class SymbolSpec:
 
 
 # Sensible fallbacks for the offline simulator / exotic broker symbol names.
+# On a live terminal these are *never* used for tradable symbols - MT5Client.spec()
+# reads the broker's own ``symbol_info`` (tick_size, tick_value, contract_size,
+# digits, volume_min/max/step), which is the only source that is correct across
+# 5-digit FX, 3-digit JPY crosses, metals (Gold/Silver) and energy (WTI).
 _FALLBACK_SPECS: Dict[str, Dict[str, Any]] = {
+    # --- FX majors & crosses (5-digit, USD-quoted) ---
     "EURUSD": {"digits": 5, "point": 0.00001, "contract_size": 100_000.0, "tick_value": 1.0, "tick_size": 0.00001},
     "GBPUSD": {"digits": 5, "point": 0.00001, "contract_size": 100_000.0, "tick_value": 1.0, "tick_size": 0.00001},
-    "USDJPY": {"digits": 3, "point": 0.001, "contract_size": 100_000.0, "tick_value": 0.671, "tick_size": 0.001},
+    "AUDUSD": {"digits": 5, "point": 0.00001, "contract_size": 100_000.0, "tick_value": 1.0, "tick_size": 0.00001},
+    "USDCAD": {"digits": 5, "point": 0.00001, "contract_size": 100_000.0, "tick_value": 0.735, "tick_size": 0.00001},
+    "USDCHF": {"digits": 5, "point": 0.00001, "contract_size": 100_000.0, "tick_value": 1.13, "tick_size": 0.00001},
+    # --- JPY crosses (3-digit) ---
+    "USDJPY": {"digits": 3, "point": 0.001, "contract_size": 100_000.0, "tick_value": 0.67, "tick_size": 0.001},
+    "EURJPY": {"digits": 3, "point": 0.001, "contract_size": 100_000.0, "tick_value": 0.67, "tick_size": 0.001},
+    "GBPJPY": {"digits": 3, "point": 0.001, "contract_size": 100_000.0, "tick_value": 0.67, "tick_size": 0.001},
+    # --- Metals & energy CFDs ---
     "XAUUSD": {"digits": 2, "point": 0.01, "contract_size": 100.0, "tick_value": 1.0, "tick_size": 0.01},
+    "XAGUSD": {"digits": 3, "point": 0.001, "contract_size": 5_000.0, "tick_value": 5.0, "tick_size": 0.001},
+    "USOIL": {"digits": 2, "point": 0.01, "contract_size": 1_000.0, "tick_value": 10.0, "tick_size": 0.01},
+    "WTI": {"digits": 2, "point": 0.01, "contract_size": 1_000.0, "tick_value": 10.0, "tick_size": 0.01},
 }
 
 
 # --------------------------------------------------------------------------- #
 # Indicators
 # --------------------------------------------------------------------------- #
-def add_indicators(df: pd.DataFrame, ema_fast: int = 50, ema_slow: int = 200, rsi_period: int = 14) -> pd.DataFrame:
-    """Attach ``ema{fast}``, ``ema{slow}``, ``rsi{period}`` and ``atr14`` columns."""
+def add_indicators(
+    df: pd.DataFrame,
+    ema_short: int = 20,
+    ema_fast: int = 50,
+    ema_slow: int = 200,
+    rsi_period: int = 14,
+) -> pd.DataFrame:
+    """Attach ``ema{short}``, ``ema{fast}``, ``ema{slow}``, ``rsi{period}`` and ``atr14`` columns."""
     if df is None or df.empty:
         return df
     out = df.copy()
+    out[f"ema{ema_short}"] = out["close"].ewm(span=ema_short, adjust=False).mean()
     out[f"ema{ema_fast}"] = out["close"].ewm(span=ema_fast, adjust=False).mean()
     out[f"ema{ema_slow}"] = out["close"].ewm(span=ema_slow, adjust=False).mean()
 
@@ -163,6 +190,7 @@ def market_context(
     timeframe: str = "",
     bars: int = 10,
     digits: Optional[int] = None,
+    ema_short: int = 20,
     ema_fast: int = 50,
     ema_slow: int = 200,
     rsi_period: int = 14,
@@ -204,6 +232,7 @@ def market_context(
         close = float(last["close"])
         context["indicators"] = {
             "close": round(close, nd),
+            f"ema{ema_short}": round(float(last.get(f"ema{ema_short}", close)), nd),
             f"ema{ema_fast}": round(float(last.get(f"ema{ema_fast}", close)), nd),
             f"ema{ema_slow}": round(float(last.get(f"ema{ema_slow}", close)), nd),
             f"rsi{rsi_period}": round(float(last.get(f"rsi{rsi_period}", 50.0)), 2),
@@ -497,7 +526,7 @@ class MT5Client:
                     "time": datetime.now(timezone.utc).isoformat(), "offline": True, "error": str(exc)}
 
     def fetch_frame(self, symbol: str, timeframe: str, count: int = 300) -> pd.DataFrame:
-        """OHLCV frame (oldest first) enriched with EMA50/200, RSI14 and ATR14."""
+        """OHLCV frame (oldest first) enriched with EMA20/50/200, RSI14 and ATR14."""
         if self.connected:
             frame = self._fetch_rates(symbol, timeframe, count)
             if frame is not None and not frame.empty:
@@ -579,7 +608,10 @@ class MT5Client:
 _BASE_PRICES: Dict[str, float] = {
     "EURUSD": 1.0850, "GBPUSD": 1.2650, "AUDUSD": 0.6600, "NZDUSD": 0.6100,
     "USDCAD": 1.3600, "USDCHF": 0.8850, "USDJPY": 150.00,
-    "XAUUSD": 2350.0, "XAGUSD": 28.00, "BTCUSD": 64000.0, "ETHUSD": 3200.0,
+    "EURJPY": 162.50, "GBPJPY": 189.00,
+    "XAUUSD": 2350.0, "XAGUSD": 28.00,
+    "USOIL": 78.50, "WTI": 78.50,
+    "BTCUSD": 64000.0, "ETHUSD": 3200.0,
 }
 
 
